@@ -1,0 +1,70 @@
+name: Preserve and sync upstream
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: preservation-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    if: github.repository_owner == 'storytold-artcraft-forks'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Back up and merge upstream without checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import json, os, urllib.request, urllib.error
+          repo = os.environ['GITHUB_REPOSITORY']
+          api = 'https://api.github.com'
+          def request(method, path, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              req = urllib.request.Request(api + path, data=data, method=method, headers={
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+                  'Content-Type': 'application/json'})
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  return json.load(response)
+          def exists(path):
+              try:
+                  return request('GET', path)
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return None
+                  raise
+          prefix = '/repos/' + repo
+          if exists(prefix + '/git/ref/heads/preservation/sync-paused'):
+              raise RuntimeError('Sync paused after a conflict. Resolve manually and remove preservation/sync-paused to resume.')
+          metadata = request('GET', prefix)
+          parent = metadata.get('parent', {})
+          expected = 'storytold/' + repo.split('/')[1]
+          if not metadata.get('fork') or parent.get('full_name') != expected:
+              raise RuntimeError('Unexpected upstream; no changes made.')
+          branch = metadata['default_branch']
+          upstream = request('GET', '/repos/' + expected + '/branches/' + branch)
+          upstream_sha = upstream['commit']['sha']
+          head = request('GET', prefix + '/git/ref/heads/' + branch)['object']['sha']
+          comparison = request('GET', prefix + '/compare/' + upstream_sha + '...' + head)
+          summary = 'Verified ' + expected + ' at ' + upstream_sha + '. '
+          if comparison['behind_by'] == 0:
+              summary += 'No upstream updates needed; independent commits preserved.'
+          else:
+              backup = 'refs/heads/preservation/backup-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+              request('POST', prefix + '/git/refs', {'ref': backup, 'sha': head})
+              try:
+                  result = request('POST', prefix + '/merge-upstream', {'branch': branch})
+              except urllib.error.HTTPError as error:
+                  if error.code == 409:
+                      request('POST', prefix + '/git/refs', {'ref': 'refs/heads/preservation/sync-paused', 'sha': head})
+                      raise RuntimeError('Conflict: sync paused; backup retained. Resolve manually. No forced update attempted.') from error
+                  raise
+              summary += result.get('message', 'Upstream merged.') + ' Backup: ' + backup
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as output:
+              output.write('## Preservation synchronization\n\n' + summary + '\n')
+          print(summary)
